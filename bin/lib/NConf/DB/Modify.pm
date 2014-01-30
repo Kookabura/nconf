@@ -29,7 +29,7 @@ BEGIN {
     use vars qw(@ISA @EXPORT @EXPORT_OK);
 
     @ISA         = qw(NConf::DB);
-    @EXPORT      = qw(@NConf::DB::EXPORT linkItems addItem insertValue addHistory queryExecModify);
+    @EXPORT      = qw(@NConf::DB::EXPORT linkItems addItem insertValue addHistory queryExecModify deleteItem modifyItem);
     @EXPORT_OK   = qw(@NConf::DB::EXPORT_OK);
 }
 
@@ -320,7 +320,7 @@ sub addItem {
     # check if an item with the same naming attr already exists (unless it's a service)
     if($class_name ne "service"){
     	if(&getItemId($main_hash{$class_naming_attr},$class_name)){
-	        &logger(2, "$class_name with $class_naming_attr '$main_hash{$class_naming_attr}' already exists!");
+	        &logger(2, "$class_name with $class_naming_attr '$main_hash{$class_naming_attr}' already exists! Try to update.");
             return undef;
     	}
 
@@ -358,7 +358,7 @@ sub addItem {
             &logger(1, "Could not find host '".$main_hash{'host_name'}."'. Aborting.");
         }
     	if(&getServiceId($main_hash{'service_description'}, &getItemId($main_hash{'host_name'},"host")) && $class_name eq "service"){
-            &logger(2, "$class_name '$main_hash{$class_naming_attr}' already exists for host \'$main_hash{'host_name'}\'!");
+            &logger(2, "$class_name '$main_hash{$class_naming_attr}' already exists for host \'$main_hash{'host_name'}\'! Try to update.");
             return undef;
     	}
     }
@@ -514,11 +514,6 @@ sub insertValue {
             }
             unless($group){next}
 
-            # quote any characters that must be escaped in SQL
-            $group = &NConf::DB::dbQuote($group);
-            $group =~ s/^'//;
-            $group =~ s/'$//;
-
             # check if the group to be linked actually exists
             my $id_group = &getItemId($group,$class_name);
 
@@ -560,7 +555,7 @@ sub insertValue {
         $attr_value = &NConf::DB::dbQuote($attr_value);
 
         my $sql  = "INSERT INTO ConfigValues (fk_id_attr, fk_id_item, attr_value) 
-                    VALUES ($id_attr,$id_item,$attr_value)";
+                    VALUES ($id_attr,$id_item,$attr_value) ON DUPLICATE KEY UPDATE attr_value = $attr_value";
 
         my $qres = &queryExecModify($sql,"Adding attr '$attr' to $class_name");
 
@@ -610,7 +605,7 @@ sub insertValue {
         $attr_value = &NConf::DB::dbQuote($attr_value);
 
         my $sql  = "INSERT INTO ConfigValues (fk_id_attr, fk_id_item, attr_value) 
-                    VALUES ($id_attr,$id_item,$attr_value)";
+                    VALUES ($id_attr,$id_item,$attr_value) ON DUPLICATE KEY UPDATE attr_value = $attr_value";
 
         my $qres = &queryExecModify($sql,"Adding attr '$attr' to $class_name");
 
@@ -661,20 +656,10 @@ sub insertValue {
 		        # get ID of host which the service belongs to
 		        my $host_id = &getItemId($hostname, 'host');
 
-                # quote any characters that must be escaped in SQL
-                $value = &NConf::DB::dbQuote($value);
-                $value =~ s/^'//;
-                $value =~ s/'$//;
-
             	# check if services to be linked actually exist
 		        $id_item_linked2 = &getServiceId($value,$host_id);
 
 	        }else{
-                # quote any characters that must be escaped in SQL
-                $value = &NConf::DB::dbQuote($value);
-                $value =~ s/^'//;
-                $value =~ s/'$//;
-
             	# check if items to be linked actually exist
             	$id_item_linked2 = &getItemId("$value","$class_attrs_hash{$class_name}->{$attr}->{'assign_to_class'}");
 	        }
@@ -746,12 +731,24 @@ sub addHistory {
     my $value    = shift;
     my $id_item  = shift;
 
-    unless($action && $name && $value && $id_item){&logger(1,"addHistory(): Missing argument(s). Aborting.")}
+    unless($action && $name && $value){&logger(1,"addHistory(): Missing argument(s). Aborting.")}
+
     $value =~ s/^'//;
     $value =~ s/'$//;
 
-    my $sql = "INSERT INTO History (user_str, action, attr_name, attr_value, fk_id_item) 
+    my $sql = undef;
+
+    if ($id_item) {
+
+        $sql = "INSERT INTO History (user_str, action, attr_name, attr_value, fk_id_item) 
                 VALUES ('Database API', '$action', '$name', '$value', $id_item)";
+
+    } else {
+
+        $sql = "INSERT INTO History (user_str, action, attr_name, attr_value) 
+                VALUES ('Database API', '$action', '$name', '$value')";
+
+    }
 
     my $qres = &queryExecModify($sql,"Adding history entry: '$action $name $value'");
 
@@ -843,6 +840,330 @@ sub queryExecModify {
     else{return $qres}
 }
 
+##############################################################################
+
+sub deleteItem {
+    &logger(5,"Entered deleteItem()");
+
+    # SUB use: Delete an item including all its attributes / values
+
+    # SUB specs: ###################
+
+    # Expected arguments:
+    # 0: The class name of the item you want to add (e.g. 'host, 'contact' etc.)
+    # 1: A hash containing name of item
+
+    # Return values:
+    # 0: 'true' on operation success,
+    #     undef on failure
+
+    ################################
+
+    # read arguments passed
+    my $class_name = shift;
+    my %main_hash  = @_;
+    $class_name = lc($class_name);
+    my $namingAttr = &getNamingAttr($class_name);
+
+    unless($class_name && %main_hash){&logger(1,"deleteItem(): Missing argument(s). Aborting.")}
+
+    ####### check that item exists
+
+    my $id_item = &getItemId($main_hash{$namingAttr},$class_name);
+
+    if (!$id_item) {
+        &logger(2,"Failed to delete $class_name item. The $class_name $main_hash{$namingAttr} doesn't exist.");
+        return undef;        
+    }
+
+    # if item is host check if assigned services exists
+    if ($class_name eq "host") {
+
+        my @service_ids = &getHostServices($id_item);
+
+        # if services exist delete them first
+        if ($service_ids[0]) {
+            foreach my $service_id (@service_ids) {
+                &logger(5,"Entered foreach '$service_id->[0]'");
+                my $name = &getItemName($service_id->[0]);
+                my $tmp_sql  = "DELETE FROM ConfigItems 
+                    WHERE id_item='$service_id->[0]'";
+                my $tmp_qres = &queryExecModify($tmp_sql,"Deleting services for host $main_hash{$namingAttr} from ConfigItems table",0,"service");
+                if ($tmp_qres) {
+                  &logger(4,"Successfully deleted service with id $service_id->[0].");
+                  &addHistory('removed','service',$main_hash{$namingAttr}.": ".$name);
+                } else {
+                    &logger(1,"Failed to delete service id $service_id->[0]. Aborting.");
+                }
+            }
+        }
+
+    }
+
+    # delete entry from ConfigItems table
+    my $sql  = "DELETE FROM ConfigItems 
+                    WHERE id_item='$id_item'";
+
+    my $qres = &queryExecModify($sql,"Deleting entry for $class_name from ConfigItems table",0,"$class_name");
+
+
+    # check deletion result. If id exists then operation is failed
+    my $check_id = &getItemId($main_hash{$namingAttr},$class_name);
+
+    if(!$check_id){
+        &logger(4,"Successfully deleted $class_name item with ID '$id_item'");
+
+        # write history entries for new item added
+        &addHistory('removed',$class_name,$main_hash{$namingAttr});
+
+    } else {
+        &logger(1,"Failed to delete $class_name item. Aborting.")
+    }
+
+    ####### determine return value and finish
+    if($qres){return "true"}
+    else{return undef}
+}
+
+##############################################################################
+
+sub modifyItem {
+    &logger(5,"Entered modifyItem()");
+
+    # SUB use: Modify an item including all its attributes / values
+
+    # SUB specs: ###################
+
+    # Expected arguments:
+    # 0: The class name of the item you want to modify (e.g. 'host, 'contact' etc.)
+    # 1: A hash containing all attr/value pairs of the item to be modified
+
+    # Return values:
+    # 0: 'true' on operation success,
+    #     undef on failure
+
+    ################################
+
+    # read arguments passed
+    my $class_name = shift;
+    my %main_hash  = @_;
+    $class_name = lc($class_name);
+
+    unless($class_name && %main_hash){&logger(1,"modifyItem(): Missing argument(s). Aborting.")}
+
+    ####### check for services which belong to multiple hosts,
+
+    # invoke addItem() recursively to add the service for each host
+    if($class_name eq "service"){
+
+        if($main_hash{'host_name'} =~ /[^,],[^,]/){
+            my @hosts = split(/,/, $main_hash{'host_name'});
+
+            foreach my $host_name (@hosts){
+                $host_name =~ s/^\s*//;
+                $host_name =~ s/\s*$//;
+
+                $main_hash{'host_name'} = $host_name;
+                &logger(3,"Adding service '$main_hash{'service_description'}' to host '$host_name'");
+                &logger(4,"Recursively invoking addItem() to add a service assigned to multiple hosts: "
+                            ."adding service '$main_hash{'service_description'}' to host '$host_name'");
+                &addItem('service', %main_hash);
+            }
+            return "true";
+        }
+    }
+
+    ####### run several checks
+
+    # get a list of all class attrs plus their properties (datatype, maxlength, mandatory etc.)
+    # list datastructure: $class_attrs_hash{'class name'}->{'attr name'}->{'property'}
+    my %class_attrs_hash = &getConfigAttrs();
+
+    # TESTCASES:
+    # Test for following behavour (test for each datatype separately):
+    # CASE 1:  Attribute exists in the DB (for the current class), 
+    #          but is not in the import file (e.g. host-preset, monitored-by)
+    # CASE 1A: Attribute is NConf-specific*, mandatory      --> try to use default value, show WARN msg
+    # CASE 1B: Attribute is NConf-specific*, not mandatory  --> try to use default value, show DEBUG msg
+    # CASE 1C: Attribute is Nagios-specific, mandatory      --> return undef, throw ERROR (abort)
+    # CASE 1D: Attribute is Nagios-specific, not mandatory  --> try to use default value, show DEBUG msg
+    # *NConf-specific meaning 'write-to-conf'=no
+    #
+    # CASE 2: Attribute exists in the import file, but is not in the DB (for the current class, 
+    #         e.g. check_freshness, active_checks_enabled)
+    # CASE 2: --> show WARN msg
+
+    ####### CHECK1:
+
+    # check if all attrs for the item to be modified exist in the database
+    foreach my $attr (keys(%main_hash)){
+        unless($class_attrs_hash{$class_name}->{$attr}->{'attr_name'}){
+
+            # skip attributes that don't exist in the DB
+            # special exceptions apply for specific class + attr combinations
+            unless(($class_name eq "service-dependency" && ($attr eq "host_name" || $attr eq "dependent_host_name"))
+                || ($class_name eq "host" && $attr eq "hostgroups")
+                || ($class_name eq "service" && $attr eq "servicegroups")
+                || ($class_name eq "contact" && $attr eq "contactgroups")){
+
+                &logger(2, "Could not find attribute '$attr' belonging to class '$class_name'. Skipping import of this attribute.");
+                $main_hash{$attr} = undef;
+            }
+        }
+
+        # special, class-specific attribute manipulation:
+        # process "check_command" attrs of services & advanced-services
+        if(($class_name eq "service" || $class_name eq "advanced-service") && $attr eq "check_command" && $main_hash{$attr} =~ /\!/){
+            # separate checkcommand from params
+            $main_hash{$attr} =~ /^([^!]+)(!.*)$/;
+            $main_hash{$attr} = $1;
+            $main_hash{'check_params'} = $2;
+        }
+    }
+
+    ####### Special processing for certain item types (dependencies, escalations etc.)
+
+    if($class_name eq "service-dependency"){
+
+        # concatenate host_names with service_descriptions into one comma separated string,
+        # then remove the host_name attributes, since NConf does not store these attributes
+
+        my $concat1 = undef;
+        my $concat2 = undef;
+        my @hosts;
+
+        if(defined($main_hash{'host_name'}) && defined($main_hash{'service_description'})){
+
+            @hosts = split(/,/, $main_hash{'host_name'});
+            my @servs = split(/,/, $main_hash{'service_description'});
+        
+            foreach my $host (@hosts){
+                unless($host){next}
+                foreach my $serv (@servs){
+                    unless($serv){next}
+                    $concat1 = $concat1.$host.",".$serv.",";                    
+                }
+            }
+            $concat1 =~ s/^,//;
+            $concat1 =~ s/,$//;
+            $main_hash{'service_description'} = $concat1;
+        } 
+
+        if(defined($main_hash{'host_name'}) && defined($main_hash{'dependent_service_description'})){
+
+            if(defined($main_hash{'dependent_host_name'})){
+                @hosts = split(/,/, $main_hash{'dependent_host_name'});
+            }
+            my @servs = split(/,/, $main_hash{'dependent_service_description'});
+        
+            foreach my $host (@hosts){
+                unless($host){next}
+                foreach my $serv (@servs){
+                    unless($serv){next}
+                    $concat2 = $concat2.$host.",".$serv.",";                    
+                }
+            }
+            $concat2 =~ s/^,//;
+            $concat2 =~ s/,$//;
+            $main_hash{'dependent_service_description'} = $concat2;
+        }
+
+        delete $main_hash{'host_name'};
+        delete $main_hash{'dependent_host_name'};
+    }
+
+    ####### CHECK2:
+
+    # determine naming attr and all mandatory attrs for current class
+    my $class_naming_attr = undef;
+    my @class_mandatory_attrs;
+    foreach my $attr (keys(%{$class_attrs_hash{$class_name}})){
+        if($class_attrs_hash{$class_name}->{$attr}->{'naming_attr'} eq "yes"){
+            if($class_naming_attr eq undef){$class_naming_attr = $attr}
+            else{&logger(1,"More than one naming attr defined for class '$class_name' in DB. Aborting.")}
+        }
+
+        if($class_attrs_hash{$class_name}->{$attr}->{'mandatory'} eq "yes"){
+        # write all mandatory attrs to an array (for later use)
+            push(@class_mandatory_attrs, $attr);
+        }else{
+            # try to lookup and use default values for empty attrs (only non-mandatory attrs)
+            if(!$main_hash{$attr} && $main_hash{$attr} ne "0" && ($class_attrs_hash{$class_name}->{$attr}->{'predef_value'} 
+            || $class_attrs_hash{$class_name}->{$attr}->{'predef_value'} eq "0")){
+                $main_hash{$attr} = $class_attrs_hash{$class_name}->{$attr}->{'predef_value'};
+                &logger(4, "Attribute '$attr' missing for current $class_name. Using default value: '$class_attrs_hash{$class_name}->{$attr}->{'predef_value'}'.");
+            }
+        }
+    }
+    unless($class_naming_attr){
+        &logger(1, "Failed to determine naming attr for class '$class_name'. Aborting.");
+    }
+
+    ####### CHECK3:
+
+    # check if all mandatory attributes have been supplied
+    foreach my $man_attr (@class_mandatory_attrs){
+        if((!$main_hash{$man_attr} && $main_hash{$man_attr} != 0) || $main_hash{$man_attr} eq ""){
+
+            # ignore NConf-specific mandatory attributes (set to default value)
+            if($class_attrs_hash{$class_name}->{$man_attr}->{'write_to_conf'} ne "yes"){
+
+
+            }else{
+                &logger(2, "Mandatory attribute '$man_attr' missing for $class_name '$main_hash{$class_naming_attr}'. Skipping import of this attribute.");
+                $main_hash{$man_attr} = undef;
+                # &logger(2, "Mandatory attribute '$man_attr' missing for $class_name '$main_hash{$class_naming_attr}'.");
+                # return undef;
+            }
+        }
+    }
+
+    ####### Modify attributes
+
+    # first of all, get item id
+    my $id_item = undef;
+
+    if ($class_name eq 'service') {
+
+        my $host_id = getItemId($main_hash{'host_name'},'host');
+        $id_item = getServiceId($main_hash{$class_naming_attr},$host_id);
+
+    }else{
+        
+        $id_item = getItemId($main_hash{$class_naming_attr},$class_name);
+    }
+
+    if ($id_item) {
+
+        # if the item is a service, then link it to its host right away
+        if($class_name eq "service"){
+            &insertValue($class_name, $id_item, "host_name", $main_hash{"host_name"});
+        }
+
+        # next, add all other attributes
+        foreach my $attr (keys(%main_hash)){
+
+            # skip adding attrs with no value (def. values should have been added to %main_hash by now, if available)
+            unless($main_hash{$attr}){
+                if($main_hash{$attr} ne "0"){next}
+            }
+
+            # skip the naming_attr, because it was already added
+            if($attr eq $class_naming_attr){next}
+
+            # for services, skip the "host_name" attr, because it was already added
+            if($attr eq "host_name" && $class_name eq "service"){next}
+
+            # error handling is done by insertValue()
+            my $retval = &insertValue($class_name, $id_item, $attr, $main_hash{$attr});
+            unless($retval eq "true"){next}
+        }
+    }
+
+    ####### determine return value and finish
+    if($id_item){return "true"}
+    else{return undef}
+}
 ##############################################################################
 
 #sub add... {
